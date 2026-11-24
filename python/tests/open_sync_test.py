@@ -11,6 +11,10 @@ class MockPipe:
     def __init__(self, chunks):
         self.chunks = list(chunks)
         self.read_count = 0
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def read(self, size=4096):
         if self.read_count < len(self.chunks):
@@ -236,56 +240,50 @@ def test_open_startup_eof_raises_and_reaps():
 
 def test_cleanup_startup_process_timeout_drains_stderr():
     """
-    Ensure TimeoutExpired during startup cleanup kills the child and runs a
-    bounded follow-up communicate() to drain remaining stderr and join reader threads.
+    Ensure timeout during non-blocking startup cleanup closes stdin, kills the child,
+    drains any remaining stderr, and deletes self.process.
     """
     instance = create_mock_open_instance()
     proc = instance.process
     proc.stdin.closed = False
+    proc.stdin.close.side_effect = lambda: setattr(proc.stdin, "closed", True)
     proc.stdout.closed = False
-    proc.stderr.closed = False
+    proc.stderr = MockPipe([b"extra stderr\n"])
     proc.poll.return_value = None
     proc.returncode = -9
-    proc.communicate.side_effect = [
-        subprocess.TimeoutExpired(cmd=["rizin"], timeout=5, stderr=b"partial "),
-        (b"", b"partial extra stderr\n"),
-    ]
 
-    rc, stderr_data = instance._cleanup_startup_process()
+    rc, stderr_data = instance._cleanup_startup_process(
+        err_tail=bytearray(b"partial "), timeout=0.0
+    )
 
     assert rc == -9
     assert stderr_data == b"partial extra stderr\n"
+    proc.stdin.close.assert_called_once()
     proc.kill.assert_called_once()
-    assert proc.communicate.call_count == 2
-    assert proc.communicate.call_args_list[0].kwargs == {"timeout": 5}
-    assert proc.communicate.call_args_list[1].kwargs == {"timeout": 1}
-    proc.wait.assert_not_called()
+    proc.wait.assert_called_once()
+    assert proc.stderr.closed
     assert not hasattr(instance, "process")
 
 
-def test_cleanup_startup_process_second_timeout_falls_back_to_wait():
+def test_cleanup_startup_process_exits_after_draining_stderr():
     """
-    Ensure a second TimeoutExpired during drain falls back to proc.wait()
-    while preserving any stderr captured so far.
+    Ensure startup cleanup returns immediately without killing when the child exits
+    while draining non-blocking stderr.
     """
     instance = create_mock_open_instance()
     proc = instance.process
     proc.stdin.closed = False
     proc.stdout.closed = False
+    proc.stderr = MockPipe([b"first\n", None, b"second\n"])
     proc.stderr.closed = False
-    proc.poll.return_value = None
-    proc.returncode = -9
-    proc.communicate.side_effect = [
-        subprocess.TimeoutExpired(cmd=["rizin"], timeout=5, stderr=b"first\n"),
-        subprocess.TimeoutExpired(cmd=["rizin"], timeout=1, stderr=b"first\nsecond\n"),
-    ]
+    proc.poll.side_effect = [None, 1]
+    proc.returncode = 1
 
-    rc, stderr_data = instance._cleanup_startup_process()
+    rc, stderr_data = instance._cleanup_startup_process(timeout=1.0)
 
-    assert rc == -9
+    assert rc == 1
     assert stderr_data == b"first\nsecond\n"
-    proc.kill.assert_called_once()
-    proc.wait.assert_called_once()
+    proc.kill.assert_not_called()
     assert not hasattr(instance, "process")
 
 
@@ -306,28 +304,17 @@ def test_open_startup_eof_hung_child_timeout_reaps_and_drains_stderr():
 
     def fake_popen(cmd, **kwargs):
         proc = real_popen([sys.executable, "-c", script], **kwargs)
-        orig_communicate = proc.communicate
-        calls = [0]
-
-        def fast_first_communicate(input=None, timeout=None):
-            calls[0] += 1
-            if calls[0] == 1 and timeout == 5:
-                timeout = 0.1
-            return orig_communicate(input=input, timeout=timeout)
-
-        proc.communicate = fast_first_communicate
-        proc._test_communicate_calls = calls
         spawned.append(proc)
         return proc
 
     with patch.object(open_sync, "Popen", side_effect=fake_popen):
-        with pytest.raises(BrokenPipeError, match=r"hung stderr") as exc_info:
-            open_sync.open("dummy")
+        with patch.object(open_sync.open, "_STARTUP_CLEANUP_TIMEOUT", 0.1):
+            with pytest.raises(BrokenPipeError, match=r"hung stderr") as exc_info:
+                open_sync.open("dummy")
 
     assert str(exc_info.value).count("hung stderr") == 1
     assert len(spawned) == 1
     proc = spawned[0]
-    assert proc._test_communicate_calls[0] == 2
     assert proc.poll() is not None
     assert proc.stdin.closed
     assert proc.stdout.closed
@@ -494,3 +481,108 @@ def test_cmd_process_ret_stderr_drain_on_nul_and_embedded_nul():
             assert rz.cmd("ping") == "synced"
             assert rz.cmd("close_err", ret_stderr=True) == "after_close"
             assert rz.cmd("ping", ret_stderr=True) == "synced"
+
+
+def test_large_stderr_does_not_deadlock_startup_or_cmd():
+    """
+    Writing >64 KiB (256 KiB) to stderr during startup and during a command with
+    ret_stderr=False must not deadlock the pipe; stderr must also be isolated per command.
+    """
+    script = (
+        "import sys\n"
+        "sys.stderr.buffer.write(b'W' * 262144 + b'\\n')\n"
+        "sys.stderr.buffer.flush()\n"
+        "sys.stdout.buffer.write(b'\\x00')\n"
+        "sys.stdout.buffer.flush()\n"
+        "for line in sys.stdin.buffer:\n"
+        "    cmd = line.strip()\n"
+        "    if cmd == b'q':\n"
+        "        sys.stdout.buffer.write(b'\\x00')\n"
+        "        sys.stdout.buffer.flush()\n"
+        "        break\n"
+        "    if cmd == b'noisy':\n"
+        "        sys.stderr.buffer.write(b'E' * 262144 + b'TAIL_NOISE\\n')\n"
+        "        sys.stderr.buffer.flush()\n"
+        "        sys.stdout.buffer.write(b'done\\x00')\n"
+        "        sys.stdout.buffer.flush()\n"
+        "    elif cmd == b'clean':\n"
+        "        sys.stderr.buffer.write(b'CLEAN_ERR\\n')\n"
+        "        sys.stderr.buffer.flush()\n"
+        "        sys.stdout.buffer.write(b'ok\\x00')\n"
+        "        sys.stdout.buffer.flush()\n"
+    )
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    with patch.object(open_sync, "Popen", side_effect=fake_popen):
+        with open_sync.open("dummy") as rz:
+            assert len(rz.last_stderr) <= open_sync.open._MAX_STDERR_BYTES
+            assert rz.cmd("noisy") == "done"
+            assert "TAIL_NOISE" in rz.last_stderr
+            assert len(rz.last_stderr) <= open_sync.open._MAX_STDERR_BYTES
+
+            out = rz.cmd("clean", ret_stderr=True)
+            assert "CLEAN_ERR" in out
+            assert "TAIL_NOISE" not in out
+
+
+def test_open_startup_eof_with_large_stderr_does_not_deadlock():
+    """
+    Child closing stdout early and then emitting >64 KiB to stderr before exiting must
+    drain without deadlocking and include the bounded stderr tail in BrokenPipeError.
+    """
+    spawned = []
+    real_popen = subprocess.Popen
+    script = (
+        "import os, sys\n"
+        "os.close(1)\n"
+        "sys.stderr.buffer.write(b'X' * 262144 + b'FATAL_TAIL\\n')\n"
+        "sys.stderr.buffer.flush()\n"
+        "sys.exit(3)\n"
+    )
+
+    def fake_popen(cmd, **kwargs):
+        proc = real_popen([sys.executable, "-c", script], **kwargs)
+        spawned.append(proc)
+        return proc
+
+    with patch.object(open_sync, "Popen", side_effect=fake_popen):
+        with pytest.raises(BrokenPipeError, match=r"exit code 3.*FATAL_TAIL"):
+            open_sync.open("dummy")
+
+    assert len(spawned) == 1
+    proc = spawned[0]
+    assert proc.poll() == 3
+    assert proc.stdin.closed
+    assert proc.stdout.closed
+    assert proc.stderr.closed
+
+
+def test_open_with_stderr_devnull():
+    """
+    Passing stderr=subprocess.DEVNULL leaves process.stderr as None and must work cleanly.
+    """
+    script = (
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\x00')\n"
+        "sys.stdout.buffer.flush()\n"
+        "for line in sys.stdin.buffer:\n"
+        "    cmd = line.strip()\n"
+        "    sys.stdout.buffer.write(b'ok\\x00')\n"
+        "    sys.stdout.buffer.flush()\n"
+        "    if cmd == b'q':\n"
+        "        break\n"
+    )
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    with patch.object(open_sync, "Popen", side_effect=fake_popen):
+        with open_sync.open("dummy", stderr=subprocess.DEVNULL) as rz:
+            assert rz.process.stderr is None
+            assert rz.cmd("i") == "ok"
+            assert rz.cmd("i", ret_stderr=True) == "ok"
+            assert rz.last_stderr == ""

@@ -24,8 +24,14 @@ except ImportError:
 
 
 class open(OpenBase):
+    _MAX_STDERR_BYTES = 65536
+    _MAX_STDERR_DRAIN_BYTES = 4 * 1024 * 1024
+    _STARTUP_CLEANUP_TIMEOUT = 5.0
+
     def __init__(self, filename="", flags=None, rizin_home=None, **kwargs):
+        stderr = kwargs.pop("stderr", PIPE)
         super(open, self).__init__(filename, flags, **kwargs)
+        self.last_stderr = ""
         if flags is None:
             flags = []
         if filename.startswith("http://"):
@@ -65,70 +71,184 @@ class open(OpenBase):
                     shell=False,
                     stdin=PIPE,
                     stdout=PIPE,
-                    stderr=PIPE,
+                    stderr=stderr,
                     bufsize=0,
                 )
             except Exception:
                 raise Exception("ERROR: Cannot find rizin in PATH")
             try:
-                # reads any startup banners and the initial \x00
-                while True:
-                    chunk = self.process.stdout.read(1024)
-                    if not chunk:
-                        rc, stderr_data = self._cleanup_startup_process()
-                        raise BrokenPipeError(
-                            self._format_eof_error(
-                                "ERROR: rizin exited before initializing pipe",
-                                rc,
-                                stderr_data,
-                            )
-                        )
-                    if b"\x00" in chunk:
-                        break
-                # make it non-blocking to speedup reading
+                # make pipes non-blocking before startup wait so stderr can be drained concurrently
                 fd = self.process.stdout.fileno()
                 if not self.__make_non_blocking(fd):
                     raise Exception("ERROR: Cannot make stdout pipe non-blocking")
-                fd = self.process.stderr.fileno()
-                if not self.__make_non_blocking(fd):
-                    raise Exception("ERROR: Cannot make stderr pipe non-blocking")
+                if self.process.stderr is not None:
+                    fd = self.process.stderr.fileno()
+                    if not self.__make_non_blocking(fd):
+                        raise Exception("ERROR: Cannot make stderr pipe non-blocking")
+                # reads any startup banners and the initial \x00 while draining stderr
+                self._wait_startup_ready()
             except BaseException:
                 self._quit_process()
                 raise
+
+    @classmethod
+    def _append_stderr_tail(cls, buf, chunk):
+        buf.extend(chunk)
+        if len(buf) > cls._MAX_STDERR_BYTES:
+            del buf[: len(buf) - cls._MAX_STDERR_BYTES]
+
+    @classmethod
+    def _drain_stderr_nonblocking(cls, err, buf=None, max_drain=None):
+        if err is None:
+            return True
+        if max_drain is None:
+            max_drain = cls._MAX_STDERR_DRAIN_BYTES
+        eof = False
+        drained = 0
+        while drained < max_drain:
+            try:
+                chunk = err.read(65536)
+            except OSError:
+                break
+            if chunk == b"":
+                eof = True
+                break
+            if not chunk or not isinstance(chunk, bytes):
+                break
+            drained += len(chunk)
+            if buf is not None:
+                cls._append_stderr_tail(buf, chunk)
+        return eof
+
+    def _wait_startup_ready(self):
+        stdo = self.process.stdout
+        err = self.process.stderr
+        stdo_fd = self._get_selectable_fd(stdo)
+        err_fd = self._get_selectable_fd(err)
+        err_eof = err is None
+        err_tail = bytearray()
+        poller = None
+        if stdo_fd is not None and hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(stdo_fd, select.POLLIN)
+            if err_fd is not None:
+                poller.register(err_fd, select.POLLIN)
+
+        while True:
+            got_data = False
+            if err is not None and not err_eof:
+                err_chunk = None
+                try:
+                    err_chunk = err.read(65536)
+                except BlockingIOError:
+                    pass
+                if err_chunk == b"":
+                    err_eof = True
+                    if poller is not None and err_fd is not None:
+                        try:
+                            poller.unregister(err_fd)
+                        except KeyError:
+                            pass
+                elif err_chunk and isinstance(err_chunk, bytes):
+                    got_data = True
+                    self._append_stderr_tail(err_tail, err_chunk)
+
+            chunk = None
+            try:
+                chunk = stdo.read(4096)
+            except BlockingIOError:
+                pass
+            if chunk == b"":
+                rc, stderr_data = self._cleanup_startup_process(err_tail)
+                raise BrokenPipeError(
+                    self._format_eof_error(
+                        "ERROR: rizin exited before initializing pipe",
+                        rc,
+                        stderr_data,
+                    )
+                )
+            if chunk:
+                got_data = True
+                if b"\x00" in chunk:
+                    if not err_eof:
+                        self._drain_stderr_nonblocking(err, err_tail)
+                    self.last_stderr = (
+                        bytes(err_tail).decode("utf-8", errors="ignore")
+                        if err_tail
+                        else ""
+                    )
+                    return
+
+            if got_data:
+                continue
+
+            if poller is not None:
+                try:
+                    poller.poll(100)
+                except InterruptedError:
+                    pass
+            elif stdo_fd is not None:
+                rlist = [stdo_fd]
+                if err_fd is not None and not err_eof:
+                    rlist.append(err_fd)
+                try:
+                    select.select(rlist, [], [], 0.1)
+                except (InterruptedError, ValueError):
+                    time.sleep(0.01)
+            else:
+                time.sleep(0.01)
 
     @staticmethod
     def _format_eof_error(prefix, rc, stderr_bytes):
         msg = prefix
         if isinstance(rc, int):
             msg = f"{msg} (exit code {rc})"
-        if isinstance(stderr_bytes, bytes) and stderr_bytes:
+        if isinstance(stderr_bytes, (bytes, bytearray)) and stderr_bytes:
             if len(stderr_bytes) > 4096:
                 stderr_bytes = stderr_bytes[-4096:]
-            err_msg = stderr_bytes.decode("utf-8", errors="ignore").strip()
+            err_msg = bytes(stderr_bytes).decode("utf-8", errors="ignore").strip()
             if err_msg:
                 msg = f"{msg}: {err_msg}"
         return msg
 
-    def _cleanup_startup_process(self):
+    def _cleanup_startup_process(self, err_tail=None, timeout=None):
         proc = getattr(self, "process", None)
         if proc is None:
             return None, b""
-        stderr_data = b""
+        if timeout is None:
+            timeout = self._STARTUP_CLEANUP_TIMEOUT
+        buf = bytearray(err_tail) if err_tail else bytearray()
         try:
-            _, stderr_data = proc.communicate(timeout=5)
-        except TimeoutExpired as exc:
-            stderr_data = exc.stderr or b""
-            if proc.poll() is None:
-                proc.kill()
-            try:
-                _, drained_stderr = proc.communicate(timeout=1)
-            except TimeoutExpired as exc2:
-                if exc2.stderr:
-                    stderr_data = exc2.stderr
-                proc.wait()
-            else:
-                if drained_stderr:
-                    stderr_data = drained_stderr
+            if proc.stdin is not None and not proc.stdin.closed:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            deadline = time.monotonic() + timeout
+            err_eof = proc.stderr is None
+            err_fd = self._get_selectable_fd(proc.stderr)
+            while True:
+                if not err_eof:
+                    err_eof = self._drain_stderr_nonblocking(proc.stderr, buf)
+                if proc.poll() is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    proc.wait()
+                    break
+                if err_fd is not None and not err_eof:
+                    try:
+                        select.select([err_fd], [], [], min(0.05, remaining))
+                    except (InterruptedError, ValueError, OSError):
+                        time.sleep(min(0.01, remaining))
+                else:
+                    try:
+                        proc.wait(timeout=min(0.05, remaining))
+                    except TimeoutExpired:
+                        pass
+            if not err_eof:
+                self._drain_stderr_nonblocking(proc.stderr, buf)
         except BaseException:
             if proc.poll() is None:
                 proc.kill()
@@ -143,7 +263,7 @@ class open(OpenBase):
                         pass
             if hasattr(self, "process"):
                 delattr(self, "process")
-        return proc.returncode, stderr_data or b""
+        return proc.returncode, bytes(buf)
 
     @staticmethod
     def __make_non_blocking(fd):
@@ -187,43 +307,22 @@ class open(OpenBase):
             return fd
         return None
 
-    @staticmethod
-    def _drain_ret_stderr(err, chunks, read_size):
-        drained = 0
-        while drained < 1048576:
-            try:
-                err_chunk = err.read(read_size)
-            except BlockingIOError:
-                break
-            if not err_chunk or not isinstance(err_chunk, bytes):
-                break
-            chunks.append(err_chunk)
-            drained += len(err_chunk)
-
-    def _raise_cmd_eof(self, err):
-        err_chunks = []
-        err_len = 0
-        if err is not None:
-            while err_len < 65536:
-                try:
-                    err_chunk = err.read(4096)
-                except OSError:
-                    break
-                if not err_chunk or not isinstance(err_chunk, bytes):
-                    break
-                err_chunks.append(err_chunk)
-                err_len += len(err_chunk)
+    def _raise_cmd_eof(self, err, err_tail=None):
+        buf = bytearray(err_tail) if err_tail else bytearray()
+        self._drain_stderr_nonblocking(err, buf)
         rc = self.process.poll()
         if rc is None:
             try:
                 rc = self.process.wait(timeout=0.05)
             except (TimeoutExpired, OSError, TypeError):
                 pass
+            self._drain_stderr_nonblocking(err, buf)
+        self.last_stderr = bytes(buf).decode("utf-8", errors="ignore") if buf else ""
         raise BrokenPipeError(
             self._format_eof_error(
                 "ERROR: rizin process closed stdout unexpectedly",
                 rc,
-                b"".join(err_chunks),
+                buf,
             )
         )
 
@@ -241,14 +340,15 @@ class open(OpenBase):
 
         stdo = self.process.stdout
         err = self.process.stderr
-        if not stdo or not err:
-            raise ValueError("self.process.stdin or stderr are None")
+        if not stdo:
+            raise ValueError("self.process.stdout is None")
 
         read_size = 65536
         ret_stderr = bool(kwargs.get("ret_stderr"))
         stdo_fd = self._get_selectable_fd(stdo)
-        err_fd = self._get_selectable_fd(err) if ret_stderr else None
-        err_eof = False
+        err_fd = self._get_selectable_fd(err)
+        err_eof = err is None
+        err_tail = bytearray()
         poller = None
         if stdo_fd is not None and hasattr(select, "poll"):
             poller = select.poll()
@@ -265,18 +365,23 @@ class open(OpenBase):
             except BlockingIOError:
                 pass
             if foo == b"":
-                self._raise_cmd_eof(err)
+                self._raise_cmd_eof(err, err_tail)
             if foo:
                 got_data = True
                 idx = foo.find(b"\0")
                 if idx != -1:
                     chunks.append(foo[:idx])
-                    if ret_stderr and not err_eof:
-                        self._drain_ret_stderr(err, chunks, read_size)
+                    if err is not None and not err_eof:
+                        extra = bytearray()
+                        self._drain_stderr_nonblocking(err, extra)
+                        if extra:
+                            self._append_stderr_tail(err_tail, extra)
+                            if ret_stderr:
+                                chunks.append(bytes(extra))
                     break
                 chunks.append(foo)
 
-            if ret_stderr and not err_eof:
+            if err is not None and not err_eof:
                 err_chunk = None
                 try:
                     err_chunk = err.read(read_size)
@@ -291,7 +396,9 @@ class open(OpenBase):
                             pass
                 elif err_chunk and isinstance(err_chunk, bytes):
                     got_data = True
-                    chunks.append(err_chunk)
+                    self._append_stderr_tail(err_tail, err_chunk)
+                    if ret_stderr:
+                        chunks.append(err_chunk)
 
             if got_data:
                 continue
@@ -312,6 +419,9 @@ class open(OpenBase):
             else:
                 time.sleep(0.01)
 
+        self.last_stderr = (
+            bytes(err_tail).decode("utf-8", errors="ignore") if err_tail else ""
+        )
         return b"".join(chunks).decode("utf-8", errors="ignore")
 
     def _cmd_http(self, cmd):
